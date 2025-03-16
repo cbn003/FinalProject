@@ -1,0 +1,236 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pathlib
+import os
+from pynwb import NWBHDF5IO
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+plt.ion()  # Enable interactive plotting
+
+# ------------------------------------------------------
+# 1. Process One NWB File (Trial-Unit Separate Rows)
+# ------------------------------------------------------
+def process_nwb_file(file_path, window_start=-1, window_end=2):
+    """
+    Process a single NWB file to extract:
+      1) Trial-level data for regression (summing spike_count across all units).
+      2) A list of spike-time arrays (each array = spikes for one unit in one trial),
+         aligned to the cue and restricted to [window_start, window_end].
+
+    Returns:
+      df_trials_final (DataFrame):
+          - 'spike_count': total # of spikes (summed across all units) in [window_start, window_end]
+          - 'response': numeric (1=correct, 0=incorrect, 2=early lick, 3=no response, else NaN)
+          - 'subject_id', 'session_id'
+      all_unit_spike_times (list of 1D arrays):
+          Each element corresponds to a single (trial, unit) row in the raster.
+          The final raster will have (#trials * #units) rows.
+    """
+    try:
+        with NWBHDF5IO(file_path, 'r') as io:
+            nwb_data = io.read()
+            
+            print(f"\nProcessing file: {file_path}")
+            print("Available intervals keys:", list(nwb_data.intervals.keys()))
+            print("Units table columns:", nwb_data.units.colnames)
+            
+            subject_id = nwb_data.subject.subject_id if nwb_data.subject else "unknown"
+            session_id = nwb_data.identifier
+            
+            if len(nwb_data.units) == 0:
+                print("No units found in file.")
+                return pd.DataFrame(), []
+            
+            # Load trial metadata
+            if "trials" not in nwb_data.intervals:
+                print("No 'trials' found in intervals.")
+                return pd.DataFrame(), []
+            trials = nwb_data.intervals["trials"]
+            df_trials = trials.to_dataframe()
+            print("Trial metadata columns:", df_trials.columns.tolist())
+            
+            # Convert times to float
+            try:
+                df_trials['start_time'] = df_trials['start_time'].astype(float)
+                df_trials['cue_start_time'] = df_trials['cue_start_time'].astype(float)
+            except Exception as e:
+                print("Error converting times to float:", e)
+            
+            # Compute absolute cue times
+            if 'cue_start_time' in df_trials.columns and 'start_time' in df_trials.columns:
+                cue_times = df_trials['start_time'].values + df_trials['cue_start_time'].values
+            else:
+                print("Missing 'cue_start_time' or 'start_time'.")
+                cue_times = np.array([])
+            
+            if cue_times.size == 0:
+                print(f"No cue times found in {file_path}")
+                return pd.DataFrame(), []
+            
+            # Map responses
+            if 'response' in df_trials.columns:
+                response_map = {
+                    "correct": 1,
+                    "incorrect": 0,
+                    "early lick": 2,
+                    "no response": 3
+                }
+                df_trials['response'] = df_trials['response'].apply(lambda x: response_map.get(x, np.nan))
+            else:
+                df_trials['response'] = np.full(len(df_trials), np.nan)
+            
+            n_units = len(nwb_data.units)
+            
+            # Summed spike count per trial for logistic regression
+            spike_counts_per_trial = np.zeros(len(df_trials), dtype=int)
+            # Raster data: one entry per (trial, unit)
+            all_unit_spike_times = []
+            
+            # For each trial
+            for t_idx, event in enumerate(cue_times):
+                # We'll accumulate the total # of spikes from all units
+                total_spike_count = 0
+                
+                # For each unit, get spikes in [window_start, window_end]
+                for unit_idx in range(n_units):
+                    unit = nwb_data.units[unit_idx]
+                    st = np.array(unit.spike_times)
+                    if st.size == 1 and isinstance(st[0], (list, np.ndarray)):
+                        st = np.array(st[0])
+                    
+                    rel_spikes = st - event
+                    mask = (rel_spikes >= window_start) & (rel_spikes <= window_end)
+                    selected_spikes = rel_spikes[mask]
+                    
+                    total_spike_count += len(selected_spikes)
+                    
+                    # Append these spikes as a separate row for the raster
+                    # i.e., one entry per (trial, unit)
+                    all_unit_spike_times.append(np.sort(selected_spikes))
+                
+                spike_counts_per_trial[t_idx] = total_spike_count
+            
+            # Build final DataFrame
+            df_trials_final = pd.DataFrame({
+                'spike_count': spike_counts_per_trial,
+                'response': df_trials['response'].values,
+                'subject_id': subject_id,
+                'session_id': session_id
+            })
+            
+            print(f"Extracted {len(df_trials_final)} trials, created {len(all_unit_spike_times)} raster rows.")
+            return df_trials_final, all_unit_spike_times
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return pd.DataFrame(), []
+
+# ------------------------------------------------------
+# 2. File Discovery
+# ------------------------------------------------------
+root_dir = pathlib.Path(r"C:\Users\neuro\000006")  # <-- Update path as needed
+nwb_file_paths = []
+for subfolder in root_dir.iterdir():
+    if subfolder.is_dir() and subfolder.name.startswith("sub-anm"):
+        for file_path in subfolder.glob("*.nwb"):
+            nwb_file_paths.append(str(file_path))
+
+print("Found NWB files:")
+for p in nwb_file_paths:
+    print(p)
+
+# ------------------------------------------------------
+# 3. Process Each NWB File
+# ------------------------------------------------------
+all_dfs = []
+all_spike_times_for_raster = []
+
+for file_i, file_path in enumerate(nwb_file_paths):
+    print(f"\nProcessing {file_path}...")
+    df_file, trial_spike_times = process_nwb_file(file_path, window_start=-1, window_end=2)
+    if not df_file.empty:
+        all_dfs.append(df_file)
+        # Add all (trial, unit) spike arrays for the raster
+        all_spike_times_for_raster.extend(trial_spike_times)
+
+if all_dfs:
+    df_combined = pd.concat(all_dfs, ignore_index=True)
+    print("\nCombined data shape:", df_combined.shape)
+    print(df_combined.head())
+else:
+    print("No valid data extracted from NWB files.")
+    df_combined = pd.DataFrame()
+
+# ------------------------------------------------------
+# 4. Raster & PSTH (One Row Per (Trial, Unit))
+# ------------------------------------------------------
+def plot_aggregated_raster(all_spike_times, window=(-1, 2)):
+    """
+    all_spike_times: list of arrays, each array = spikes for one (trial, unit).
+    The y-axis enumerates (trial, unit) pairs in ascending order.
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for row_idx, spikes in enumerate(all_spike_times):
+        ax.vlines(spikes, row_idx + 0.5, row_idx + 1.5)
+    ax.set_xlabel("Time (s) relative to cue")
+    ax.set_ylabel("(Trial, Unit) row")
+    ax.set_title("Aggregated Raster (Separate Row per Unit)")
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(2)
+
+def plot_aggregated_psth(all_spike_times, window=(-1, 2), bin_size=0.05):
+    """
+    PSTH across all (trial, unit) rows combined.
+    """
+    bins = np.arange(window[0], window[1] + bin_size, bin_size)
+    psth = np.zeros(len(bins) - 1, dtype=float)
+    for spikes in all_spike_times:
+        counts, _ = np.histogram(spikes, bins=bins)
+        psth += counts
+    n_rows = len(all_spike_times)
+    if n_rows > 0:
+        psth /= n_rows
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(bins[:-1], psth, width=bin_size, align='edge')
+    ax.set_xlabel("Time (s) relative to cue")
+    ax.set_ylabel("Avg spike count per (trial, unit) row")
+    ax.set_title("Aggregated PSTH (Separate Row per Unit)")
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(2)
+
+if all_spike_times_for_raster:
+    print(f"\nPlotting raster with {len(all_spike_times_for_raster)} rows = (#trials * #units).")
+    plot_aggregated_raster(all_spike_times_for_raster, window=(-1, 2))
+    plot_aggregated_psth(all_spike_times_for_raster, window=(-1, 2), bin_size=0.05)
+else:
+    print("No spike times available for the raster/PSTH.")
+
+# ------------------------------------------------------
+# 5. Logistic Regression (Correct vs. Incorrect)
+# ------------------------------------------------------
+if not df_combined.empty:
+    # Keep only 0 or 1 for logistic regression
+    df_reg = df_combined[df_combined['response'].isin([0, 1])]
+    if not df_reg.empty:
+        X = df_reg[['spike_count']].values
+        y = df_reg['response'].values
+        if len(y) > 0:
+            model = LogisticRegression()
+            scores = cross_val_score(model, X, y, cv=5, scoring='accuracy')
+            print("\nMean cross-validated accuracy (correct vs. incorrect): {:.2f}%".format(scores.mean() * 100))
+            model.fit(X, y)
+            print("Final model coefficients:", model.coef_)
+        else:
+            print("No valid 0/1 responses for regression.")
+    else:
+        print("No correct/incorrect trials for regression.")
+else:
+    print("No combined data for regression analysis.")
+
+# ------------------------------------------------------
+# 6. Keep Plots Open
+# ------------------------------------------------------
+input("Press Enter to exit...")
